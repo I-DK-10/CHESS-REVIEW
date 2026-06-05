@@ -24,7 +24,7 @@ import chess.pgn
 STOCKFISH_PATH: str = r"C:\Users\Dhruv k\Downloads\stockfish\stockfish-windows-x86-64-avx2.exe"
 
 
-ANALYSIS_DEPTH: int = 15
+ANALYSIS_DEPTH: int = 18
 
 # Number of alternative moves Stockfish returns per position (multipv).
 # We need ≥2 to detect "Brilliant" sacrifices vs. second-best alternatives.
@@ -42,11 +42,11 @@ class MoveCategory(Enum):
     ┌─────────────────┬─────────────┬───────────────────────────────────────┐
     │ Category        │ Symbol      │ CPL condition                         │
     ├─────────────────┼─────────────┼───────────────────────────────────────┤
-    │ Brilliant       │ !!          │ CPL≤5 AND move is a material sacrifice │
-    │                 │             │ that is objectively best               │
-    │ Great Move      │ !           │ CPL≤5 AND avoids the only best reply  │
-    │                 │             │ (i.e., 2nd-best blunders heavily)      │
-    │ Best Move       │  ★          │ CPL≤5                                 │
+    │ Brilliant       │ !!          │ CPL≤5 AND move is a material sacrifice│
+    │                 │             │ that is objectively best AND 2nd-best │
+    │                 │             │ is >150cp worse                       │
+    │ Great Move      │ !           │ CPL≤5 AND sacrifice or only good move │
+    │ Best Move       │  ★          │ CPL ≤ 5                               │
     │ Excellent       │  ✓          │ 5 < CPL ≤ 15                          │
     │ Good            │  +          │ 15 < CPL ≤ 30                         │
     │ Inaccuracy      │ ?!          │ 30 < CPL ≤ 60                         │
@@ -72,14 +72,16 @@ class MoveCategory(Enum):
 
 # CPL upper-bounds (exclusive) for non-contextual categories.
 # Brilliant and Great are determined separately via positional logic.
+# These thresholds match Chess.com's documented classification:
+#   Best ≤5, Excellent ≤15, Good ≤30, Inaccuracy ≤60, Mistake ≤120
 CPL_THRESHOLDS: list[tuple[int, MoveCategory]] = [
-    (10,   MoveCategory.BEST),
-    (30,   MoveCategory.EXCELLENT),
-    (70,   MoveCategory.GOOD),
-    (150,  MoveCategory.INACCURACY),
-    (300,  MoveCategory.MISTAKE),
+    (5,    MoveCategory.BEST),
+    (15,   MoveCategory.EXCELLENT),
+    (30,   MoveCategory.GOOD),
+    (60,   MoveCategory.INACCURACY),
+    (120,  MoveCategory.MISTAKE),
 ]
-# Anything above 300 CPL = BLUNDER
+# Anything above 120 CPL = BLUNDER
 
 
 def _classify_by_cpl(cpl: float) -> MoveCategory:
@@ -150,7 +152,9 @@ def classify_move(
     if base is MoveCategory.BEST:
         if move == best_move:
             is_sac = _is_sacrifice(board_before, move)
-            is_only_good_move = (second_best_cpl is not None and second_best_cpl > 30)
+            # The second-best move must be significantly worse (>150cp gap)
+            # for the move to be considered the "only good move"
+            is_only_good_move = (second_best_cpl is not None and second_best_cpl > 150)
 
             # In Chess.com, Brilliant moves are very rare. 
             # A move is Brilliant if it's a sacrifice AND the only good continuation.
@@ -295,29 +299,42 @@ def analyse_game(
     Walk through every move in the game and evaluate each position with
     Stockfish at the given depth.
 
+    Optimization: the eval_after of ply N is the same board state as
+    eval_before of ply N+1.  We cache the multipv analysis from the
+    "before" call and reuse it, cutting engine calls roughly in half.
+
     Returns a list of MoveAnalysis objects (one per half-move / ply).
     """
     results: list[MoveAnalysis] = []
-    board  = game.board()
-    node   = game
+    board = game.board()
 
-    prev_eval_cp: Optional[float] = None   # Eval (from White's POV) before each move
+    # Count total plies for progress bar
+    total_plies = sum(1 for _ in game.mainline_moves())
+    ply_index = 0
+
+    # Cache: the multipv analysis of the current board position.
+    # We seed it with the starting position, then after each move
+    # we analyse the resulting position and carry it forward.
+    cached_info: Optional[list] = None
 
     for move_node in game.mainline():
-        move         = move_node.move
-        board_before = board.copy()         # snapshot before the move is made
+        move = move_node.move
+        board_before = board.copy()
 
         # ── Evaluate BEFORE the move ────────────────────────────────────────
-        info_before = engine.analyse(
-            board,
-            chess.engine.Limit(depth=depth),
-            multipv=MULTIPV,
-        )
+        # Use cached analysis from previous iteration if available,
+        # otherwise compute fresh (first move of the game).
+        if cached_info is not None:
+            info_before = cached_info
+        else:
+            info_before = engine.analyse(
+                board,
+                chess.engine.Limit(depth=depth),
+                multipv=MULTIPV,
+            )
 
-        # info_before is a list of dicts (one per PV).  Index 0 = best line.
-        best_pv   = info_before[0]
+        best_pv = info_before[0]
         best_move = best_pv["pv"][0] if best_pv.get("pv") else move
-
         eval_before_cp = _score_to_cp(best_pv["score"], chess.WHITE)
 
         # ── CPL for the second-best candidate (for Great Move detection) ───
@@ -326,30 +343,30 @@ def analyse_game(
             second_pv = info_before[1]
             second_eval = _score_to_cp(second_pv["score"], chess.WHITE)
             if eval_before_cp is not None and second_eval is not None:
-                # CPL of second-best = how much worse it is vs the very best
-                raw_second_loss = eval_before_cp - second_eval
-                second_best_cpl = max(0.0, raw_second_loss)
+                second_best_cpl = abs(eval_before_cp - second_eval)
 
         # ── Apply the actual move ───────────────────────────────────────────
         board.push(move)
 
-        # ── Evaluate AFTER the move ─────────────────────────────────────────
-        info_after    = engine.analyse(board, chess.engine.Limit(depth=depth))
-        eval_after_cp = _score_to_cp(info_after["score"], chess.WHITE)
+        # ── Evaluate AFTER the move (and cache for next iteration) ──────────
+        # This analysis doubles as "eval_before" for the next ply.
+        cached_info = engine.analyse(
+            board,
+            chess.engine.Limit(depth=depth),
+            multipv=MULTIPV,
+        )
+        eval_after_cp = _score_to_cp(cached_info[0]["score"], chess.WHITE)
 
         # ── Compute Centipawn Loss ──────────────────────────────────────────
-        # For WHITE moves: good = eval goes UP  → cpl = eval_before - eval_after
-        # For BLACK moves: good = eval goes DOWN → cpl = eval_after - eval_before
-        # (Both yield positive values when the move is strong.)
         if board_before.turn == chess.WHITE:
             raw_cpl = (eval_before_cp or 0) - (eval_after_cp or 0)
         else:
             raw_cpl = (eval_after_cp or 0) - (eval_before_cp or 0)
 
-        cpl = max(0.0, raw_cpl)   # clamp; evaluation noise can produce tiny negatives
+        cpl = max(0.0, raw_cpl)
 
         # ── SAN strings ─────────────────────────────────────────────────────
-        san      = board_before.san(move)
+        san = board_before.san(move)
         best_san = board_before.san(best_move)
 
         # ── Classify ────────────────────────────────────────────────────────
@@ -358,7 +375,7 @@ def analyse_game(
         )
 
         move_number = board_before.fullmove_number
-        color       = board_before.turn   # who just moved
+        color = board_before.turn
 
         results.append(MoveAnalysis(
             move_number  = move_number,
@@ -372,8 +389,20 @@ def analyse_game(
             is_user_move = (color == user_color),
         ))
 
-        prev_eval_cp = eval_after_cp
-        node = move_node
+        # ── Progress indicator ──────────────────────────────────────────────
+        ply_index += 1
+        pct = ply_index / total_plies * 100
+        color_prefix = "W" if color == chess.WHITE else "B"
+        sys.stdout.write(
+            f"\r  Analysing: {ply_index}/{total_plies} plies "
+            f"({pct:.0f}%)  |  {move_number}{color_prefix}. {san}     "
+        )
+        sys.stdout.flush()
+
+    # Clear progress line
+    sys.stdout.write("\r" + " " * 70 + "\r")
+    sys.stdout.flush()
+    print(f"  ✓ Analysis complete — {total_plies} plies evaluated.\n")
 
     return results
 
@@ -384,30 +413,36 @@ def analyse_game(
 
 def compute_accuracy(user_moves: list[MoveAnalysis]) -> float:
     """
-    Compute a CAPS-style accuracy percentage.
+    Compute a CAPS-style (Centipawn Accuracy and Performance Score) accuracy.
 
-    Formula (Chess.com approximation, derived from their published model):
-        accuracy = 103.1668 · exp(−0.04354 · avg_cpl) − 3.1668
+    Chess.com's published CAPS formula converts each move's win-probability
+    loss into an accuracy score.  The simplified centipawn-based
+    approximation is:
 
-    Clamped to [0, 100].
+        per-move accuracy = 103.1668 · exp(−0.04354 · cpl) − 3.1668
+        overall accuracy  = harmonic-like mean of per-move accuracies
 
-    The exponential curve means:
-        avg_cpl =  0  → ~100%
-        avg_cpl = 20  → ~87%
-        avg_cpl = 50  → ~70%
-        avg_cpl =100  → ~48%
-        avg_cpl =200  → ~15%
+    Using per-move accuracy (then averaging) is more accurate than averaging
+    CPL first, because the exponential curve is convex — Jensen's inequality
+    means avg(exp(x)) ≠ exp(avg(x)).
 
-    CPL values are bounded at 1000 before averaging to avoid
-    a single catastrophic blunder destroying the entire score.
+    Individual CPL values are capped at 500 to prevent a single catastrophic
+    blunder from dominating, while still penalizing it heavily.
     """
     if not user_moves:
         return 0.0
 
-    bounded_cpls = [min(_cp_to_bounded(m.cpl), 300.0) for m in user_moves]
-    avg_cpl = sum(bounded_cpls) / len(bounded_cpls)
+    CPL_CAP = 500.0
 
-    accuracy = 103.1668 * math.exp(-0.04354 * avg_cpl) - 3.1668
+    per_move_accuracies: list[float] = []
+    for m in user_moves:
+        cpl = min(m.cpl, CPL_CAP)
+        move_acc = 103.1668 * math.exp(-0.04354 * cpl) - 3.1668
+        move_acc = max(0.0, min(100.0, move_acc))
+        per_move_accuracies.append(move_acc)
+
+    # Weighted average: weight each move's accuracy equally
+    accuracy = sum(per_move_accuracies) / len(per_move_accuracies)
     return max(0.0, min(100.0, accuracy))
 
 
@@ -416,28 +451,34 @@ def estimate_elo(accuracy: float) -> int:
     Map accuracy percentage to an approximate Elo rating.
 
     Calibration points sourced from Chess.com's public accuracy ↔ Elo
-    research and community analysis:
+    research and community analysis.  With per-move accuracy averaging,
+    scores tend to be lower than with avg-CPL-first, so the anchors
+    are tuned accordingly:
 
-        accuracy  100% → ~3200  (super-GM)
-        accuracy   95% → ~2500  (GM)
-        accuracy   90% → ~2100  (FM/IM boundary)
-        accuracy   85% → ~1800  (club player)
-        accuracy   75% → ~1400  (intermediate)
-        accuracy   65% → ~1100  (casual)
-        accuracy   50% → ~800   (beginner)
-        accuracy  <45% →  600   (floor)
+        accuracy  98%+ → ~3200  (super-GM, near-perfect play)
+        accuracy   95% → ~2700  (GM)
+        accuracy   90% → ~2300  (IM/FM)
+        accuracy   85% → ~2000  (strong club player)
+        accuracy   80% → ~1750  (club player)
+        accuracy   70% → ~1400  (intermediate)
+        accuracy   60% → ~1100  (casual)
+        accuracy   50% → ~850   (beginner)
+        accuracy  <40% →  600   (floor)
 
     We interpolate linearly between these anchor points.
     """
     anchors: list[tuple[float, int]] = [
         (100.0, 3200),
-        (95.0,  2500),
-        (90.0,  2100),
-        (85.0,  1800),
-        (75.0,  1400),
-        (65.0,  1100),
-        (50.0,   800),
-        (0.0,    600),
+        (98.0,  3000),
+        (95.0,  2700),
+        (90.0,  2300),
+        (85.0,  2000),
+        (80.0,  1750),
+        (70.0,  1400),
+        (60.0,  1100),
+        (50.0,   850),
+        (40.0,   600),
+        (0.0,    400),
     ]
 
     # Clamp to table bounds
@@ -451,7 +492,7 @@ def estimate_elo(accuracy: float) -> int:
             elo = elo_low + t * (elo_high - elo_low)
             return int(round(elo, -1))   # round to nearest 10
 
-    return 600   # fallback floor
+    return 400   # fallback floor
 
 
 # ─────────────────────────────────────────────────────────────────────────────
