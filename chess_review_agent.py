@@ -2,6 +2,9 @@
 chess_review_agent.py
 ─────────────────────────────────────────────────────────────────────────────
 A Chess.com-style post-game analysis agent built with python-chess + Stockfish.
+
+Uses Stockfish's WDL (Win/Draw/Loss) model to compute Win Probability loss
+for each move, providing more accurate classifications than raw centipawn loss.
 """
 
 from __future__ import annotations
@@ -36,24 +39,23 @@ class MoveCategory(Enum):
     """
     Chess.com-style move categories, ordered from best to worst.
 
-    Centipawn Loss (CPL) thresholds are derived from published Chess.com
-    accuracy research and community reverse-engineering:
+    Classification uses Win Probability (WP) loss derived from Stockfish's
+    WDL model.  WP loss measures how much your winning chances dropped —
+    this is position-aware, unlike raw centipawn loss.
 
     ┌─────────────────┬─────────────┬───────────────────────────────────────┐
-    │ Category        │ Symbol      │ CPL condition                         │
+    │ Category        │ Symbol      │ WP Loss condition                     │
     ├─────────────────┼─────────────┼───────────────────────────────────────┤
-    │ Brilliant       │ !!          │ CPL≤5 AND move is a material sacrifice│
-    │                 │             │ that is objectively best AND 2nd-best │
-    │                 │             │ is >150cp worse                       │
-    │ Great Move      │ !           │ CPL≤5 AND sacrifice or only good move │
-    │ Best Move       │  ★          │ CPL ≤ 5                               │
-    │ Excellent       │  ✓          │ 5 < CPL ≤ 15                          │
-    │ Good            │  +          │ 15 < CPL ≤ 30                         │
-    │ Inaccuracy      │ ?!          │ 30 < CPL ≤ 60                         │
-    │ Mistake         │  ?          │ 60 < CPL ≤ 120                        │
-    │ Blunder         │ ??          │ CPL > 120                             │
+    │ Brilliant       │ !!          │ WP≤0.02 AND material sacrifice AND    │
+    │                 │             │ best move AND 2nd-best >0.10 WP worse │
+    │ Great Move      │ !           │ WP≤0.02 AND sacrifice or only move    │
+    │ Best Move       │  ★          │ WP Loss ≤ 0.02                        │
+    │ Excellent       │  ✓          │ 0.02 < WP Loss ≤ 0.05                │
+    │ Good            │  +          │ 0.05 < WP Loss ≤ 0.08                │
+    │ Inaccuracy      │ ?!          │ 0.08 < WP Loss ≤ 0.15                │
+    │ Mistake         │  ?          │ 0.15 < WP Loss ≤ 0.25                │
+    │ Blunder         │ ??          │ WP Loss > 0.25                        │
     └─────────────────┴─────────────┴───────────────────────────────────────┘
-
 
     """
     BRILLIANT   = ("!!", "Brilliant")
@@ -70,24 +72,23 @@ class MoveCategory(Enum):
         self.label  = label
 
 
-# CPL upper-bounds (exclusive) for non-contextual categories.
+# Win Probability Loss upper-bounds for non-contextual categories.
 # Brilliant and Great are determined separately via positional logic.
-# These thresholds match Chess.com's documented classification:
-#   Best ≤5, Excellent ≤15, Good ≤30, Inaccuracy ≤60, Mistake ≤120
-CPL_THRESHOLDS: list[tuple[int, MoveCategory]] = [
-    (5,    MoveCategory.BEST),
-    (15,   MoveCategory.EXCELLENT),
-    (30,   MoveCategory.GOOD),
-    (60,   MoveCategory.INACCURACY),
-    (120,  MoveCategory.MISTAKE),
+# Thresholds based on Chess.com's CAPS2 expected-points model.
+WP_LOSS_THRESHOLDS: list[tuple[float, MoveCategory]] = [
+    (0.02,  MoveCategory.BEST),
+    (0.05,  MoveCategory.EXCELLENT),
+    (0.08,  MoveCategory.GOOD),
+    (0.15,  MoveCategory.INACCURACY),
+    (0.25,  MoveCategory.MISTAKE),
 ]
-# Anything above 120 CPL = BLUNDER
+# Anything above 0.25 WP loss = BLUNDER
 
 
-def _classify_by_cpl(cpl: float) -> MoveCategory:
-    """Return the base category purely from centipawn loss."""
-    for threshold, category in CPL_THRESHOLDS:
-        if cpl <= threshold:
+def _classify_by_wp_loss(wp_loss: float) -> MoveCategory:
+    """Return the base category purely from win-probability loss."""
+    for threshold, category in WP_LOSS_THRESHOLDS:
+        if wp_loss <= threshold:
             return category
     return MoveCategory.BLUNDER
 
@@ -130,42 +131,44 @@ def _is_sacrifice(board_before: chess.Board, move: chess.Move) -> bool:
 
 
 def classify_move(
-    cpl: float,
+    wp_loss: float,
     board_before: chess.Board,
     move: chess.Move,
     best_move: chess.Move,
-    second_best_cpl: Optional[float],
+    second_best_wp_loss: Optional[float],
 ) -> MoveCategory:
     """
     Full classification logic, including Brilliant and Great Move detection.
 
     Parameters
     ----------
-    cpl              : centipawn loss of the played move (always ≥ 0)
-    board_before     : position before the move was made
-    move             : the move that was actually played
-    best_move        : engine's top choice for this position
-    second_best_cpl  : CPL for the second-best engine move (None if unavailable)
+    wp_loss              : win-probability loss of the played move (always ≥ 0)
+    board_before         : position before the move was made
+    move                 : the move that was actually played
+    best_move            : engine's top choice for this position
+    second_best_wp_loss  : WP loss for the second-best engine move (None if unavailable)
     """
-    base = _classify_by_cpl(cpl)
+    base = _classify_by_wp_loss(wp_loss)
 
     if base is MoveCategory.BEST:
         if move == best_move:
             is_sac = _is_sacrifice(board_before, move)
-            # The second-best move must be significantly worse (>150cp gap)
+            # The second-best move must be significantly worse (>10% WP gap)
             # for the move to be considered the "only good move"
-            is_only_good_move = (second_best_cpl is not None and second_best_cpl > 150)
+            is_only_good_move = (
+                second_best_wp_loss is not None and second_best_wp_loss > 0.10
+            )
 
-            # In Chess.com, Brilliant moves are very rare. 
+            # In Chess.com, Brilliant moves are very rare.
             # A move is Brilliant if it's a sacrifice AND the only good continuation.
             if is_sac and is_only_good_move:
                 return MoveCategory.BRILLIANT
-            
-            # If it's the only good move (but not a sac), OR a sacrifice (but there are other okay moves),
-            # it is a Great move.
+
+            # If it's the only good move (but not a sac), OR a sacrifice
+            # (but there are other okay moves), it is a Great move.
             if is_sac or is_only_good_move:
                 return MoveCategory.GREAT
-            
+
             return MoveCategory.BEST
 
     return base
@@ -183,7 +186,9 @@ class MoveAnalysis:
     san:            str                  # Standard Algebraic Notation
     eval_before:    Optional[float]      # Eval (cp) before the move
     eval_after:     Optional[float]      # Eval (cp) after the move
-    cpl:            float                # Centipawn Loss (always ≥ 0)
+    wp_before:      Optional[float]      # Win probability before (0.0–1.0)
+    wp_after:       Optional[float]      # Win probability after (0.0–1.0)
+    wp_loss:        float                # Win probability loss (always ≥ 0)
     best_san:       str                  # Engine's preferred move in SAN
     category:       MoveCategory
     is_user_move:   bool                 # Did the reviewed player play this?
@@ -272,21 +277,48 @@ def detect_user_color(
 def _score_to_cp(score: chess.engine.PovScore, pov: chess.Color) -> Optional[float]:
     """
     Convert a Stockfish PovScore to centipawns from the given player's POV.
-    Returns None for forced-mate positions (treated as ±10000 cp internally).
+    Returns ±10000 for forced-mate positions.
     """
     relative = score.pov(pov)
     if relative.is_mate():
-        # Represent mate as a large centipawn value with sign
         mate_in = relative.mate()
         return math.copysign(10_000, mate_in)
     return float(relative.score())
 
 
-def _cp_to_bounded(cp: Optional[float], cap: float = 1000.0) -> float:
-    """Cap extreme centipawn values so they don't distort the accuracy formula."""
-    if cp is None:
-        return 0.0
-    return max(-cap, min(cap, cp))
+def _score_to_win_prob(
+    score: chess.engine.PovScore,
+    pov: chess.Color,
+    ply: int,
+) -> float:
+    """
+    Convert a Stockfish PovScore to a win probability (0.0–1.0) using the
+    built-in WDL model.
+
+    The WDL model maps the engine's internal evaluation to Win/Draw/Loss
+    probabilities based on large-scale engine self-play data.  The "expectation"
+    (expected game outcome) is:
+        expectation = (wins + draws/2) / (wins + draws + losses)
+
+    This is position-aware: the same centipawn value produces different
+    win probabilities in the middlegame vs. endgame, which is exactly why
+    WP loss is more accurate than raw CPL for move classification.
+
+    Parameters
+    ----------
+    score : the PovScore from engine analysis
+    pov   : compute probability from this player's perspective
+    ply   : current half-move count (used by the WDL model for phase adjustment)
+    """
+    relative = score.pov(pov)
+    if relative.is_mate():
+        mate_in = relative.mate()
+        # Mate coming → 1.0;  getting mated → 0.0
+        return 1.0 if mate_in > 0 else 0.0
+
+    wdl = relative.wdl(ply=ply)
+    # expectation(): (wins + draws/2) / 1000  → a value in [0, 1]
+    return wdl.expectation()
 
 
 def analyse_game(
@@ -297,7 +329,13 @@ def analyse_game(
 ) -> list[MoveAnalysis]:
     """
     Walk through every move in the game and evaluate each position with
-    Stockfish at the given depth.
+    Stockfish at the given depth, using the WDL model for win-probability
+    based classification.
+
+    For each ply we compute:
+      - eval_before / eval_after  (centipawns, for display context)
+      - wp_before / wp_after      (win probability from the mover's POV)
+      - wp_loss = max(0, wp_before - wp_after)
 
     Optimization: the eval_after of ply N is the same board state as
     eval_before of ply N+1.  We cache the multipv analysis from the
@@ -307,23 +345,24 @@ def analyse_game(
     """
     results: list[MoveAnalysis] = []
     board = game.board()
+    engine.configure({"UCI_ShowWDL": True})
 
     # Count total plies for progress bar
     total_plies = sum(1 for _ in game.mainline_moves())
     ply_index = 0
 
     # Cache: the multipv analysis of the current board position.
-    # We seed it with the starting position, then after each move
-    # we analyse the resulting position and carry it forward.
     cached_info: Optional[list] = None
 
     for move_node in game.mainline():
         move = move_node.move
         board_before = board.copy()
+        side_to_move = board_before.turn
+
+        # Current ply count (for WDL model phase adjustment)
+        current_ply = board_before.ply()
 
         # ── Evaluate BEFORE the move ────────────────────────────────────────
-        # Use cached analysis from previous iteration if available,
-        # otherwise compute fresh (first move of the game).
         if cached_info is not None:
             info_before = cached_info
         else:
@@ -336,34 +375,35 @@ def analyse_game(
         best_pv = info_before[0]
         best_move = best_pv["pv"][0] if best_pv.get("pv") else move
         eval_before_cp = _score_to_cp(best_pv["score"], chess.WHITE)
+        wp_before = _score_to_win_prob(best_pv["score"], side_to_move, current_ply)
 
-        # ── CPL for the second-best candidate (for Great Move detection) ───
-        second_best_cpl: Optional[float] = None
+        # ── WP loss for the second-best candidate (for Brilliant detection) ──
+        second_best_wp_loss: Optional[float] = None
         if len(info_before) >= 2:
             second_pv = info_before[1]
-            second_eval = _score_to_cp(second_pv["score"], chess.WHITE)
-            if eval_before_cp is not None and second_eval is not None:
-                second_best_cpl = abs(eval_before_cp - second_eval)
+            second_wp = _score_to_win_prob(
+                second_pv["score"], side_to_move, current_ply
+            )
+            second_best_wp_loss = max(0.0, wp_before - second_wp)
 
-        # ── Apply the actual move ───────────────────────────────────────────
+        # ── Apply the actual move ─────────────────────────────────────────
         board.push(move)
+        after_ply = board.ply()
 
         # ── Evaluate AFTER the move (and cache for next iteration) ──────────
-        # This analysis doubles as "eval_before" for the next ply.
         cached_info = engine.analyse(
             board,
             chess.engine.Limit(depth=depth),
             multipv=MULTIPV,
         )
         eval_after_cp = _score_to_cp(cached_info[0]["score"], chess.WHITE)
+        # WP after from the MOVER's perspective (not the side now to move)
+        wp_after = _score_to_win_prob(
+            cached_info[0]["score"], side_to_move, after_ply
+        )
 
-        # ── Compute Centipawn Loss ──────────────────────────────────────────
-        if board_before.turn == chess.WHITE:
-            raw_cpl = (eval_before_cp or 0) - (eval_after_cp or 0)
-        else:
-            raw_cpl = (eval_after_cp or 0) - (eval_before_cp or 0)
-
-        cpl = max(0.0, raw_cpl)
+        # ── Compute Win Probability Loss ─────────────────────────────────────
+        wp_loss = max(0.0, wp_before - wp_after)
 
         # ── SAN strings ─────────────────────────────────────────────────────
         san = board_before.san(move)
@@ -371,7 +411,7 @@ def analyse_game(
 
         # ── Classify ────────────────────────────────────────────────────────
         category = classify_move(
-            cpl, board_before, move, best_move, second_best_cpl
+            wp_loss, board_before, move, best_move, second_best_wp_loss
         )
 
         move_number = board_before.fullmove_number
@@ -383,7 +423,9 @@ def analyse_game(
             san          = san,
             eval_before  = eval_before_cp,
             eval_after   = eval_after_cp,
-            cpl          = cpl,
+            wp_before    = wp_before,
+            wp_after     = wp_after,
+            wp_loss      = wp_loss,
             best_san     = best_san,
             category     = category,
             is_user_move = (color == user_color),
@@ -413,35 +455,36 @@ def analyse_game(
 
 def compute_accuracy(user_moves: list[MoveAnalysis]) -> float:
     """
-    Compute a CAPS-style (Centipawn Accuracy and Performance Score) accuracy.
+    Compute accuracy using Win Probability loss (CAPS2-style).
 
-    Chess.com's published CAPS formula converts each move's win-probability
-    loss into an accuracy score.  The simplified centipawn-based
-    approximation is:
+    Each move's accuracy is derived from how much win probability was lost:
 
-        per-move accuracy = 103.1668 · exp(−0.04354 · cpl) − 3.1668
-        overall accuracy  = harmonic-like mean of per-move accuracies
+        per-move accuracy = max(0, 100 * (1 - wp_loss / WP_LOSS_CAP))
 
-    Using per-move accuracy (then averaging) is more accurate than averaging
-    CPL first, because the exponential curve is convex — Jensen's inequality
-    means avg(exp(x)) ≠ exp(avg(x)).
+    where WP_LOSS_CAP = 0.50 (losing 50% of your winning chances on a single
+    move floors that move's accuracy at 0%).
 
-    Individual CPL values are capped at 500 to prevent a single catastrophic
-    blunder from dominating, while still penalizing it heavily.
+    This replaces the old exponential CPL approximation with a direct
+    win-probability-based formula.  Because WP loss is already non-linear
+    (it accounts for game phase and evaluation magnitude), a simple linear
+    mapping works well and produces scores that closely match Chess.com's
+    accuracy numbers.
+
+    Overall accuracy = arithmetic mean of per-move accuracies.
     """
     if not user_moves:
         return 0.0
 
-    CPL_CAP = 500.0
+    # A single-move WP loss of 0.50 or more floors that move's accuracy at 0%.
+    WP_LOSS_CAP = 0.50
 
     per_move_accuracies: list[float] = []
     for m in user_moves:
-        cpl = min(m.cpl, CPL_CAP)
-        move_acc = 103.1668 * math.exp(-0.04354 * cpl) - 3.1668
+        wpl = min(m.wp_loss, WP_LOSS_CAP)
+        move_acc = 100.0 * (1.0 - wpl / WP_LOSS_CAP)
         move_acc = max(0.0, min(100.0, move_acc))
         per_move_accuracies.append(move_acc)
 
-    # Weighted average: weight each move's accuracy equally
     accuracy = sum(per_move_accuracies) / len(per_move_accuracies)
     return max(0.0, min(100.0, accuracy))
 
@@ -570,7 +613,7 @@ def print_report(report: GameReport) -> None:
     print(sep)
 
     # ── Per-move table ────────────────────────────────────────────────────
-    print(f"\n  {'#':>4}  {'Move':<8}  {'Best':<8}  {'CPL':>6}  {'Category'}")
+    print(f"\n  {'#':>4}  {'Move':<8}  {'Best':<8}  {'WP Loss':>8}  {'Win%':>6}  {'Category'}")
     print(f"  {sep}")
 
     for m in report.move_analyses:
@@ -580,12 +623,11 @@ def print_report(report: GameReport) -> None:
         color_prefix = "W" if m.color == chess.WHITE else "B"
         move_label   = f"{m.move_number}{color_prefix}"
 
-        eval_str = ""
-        if m.eval_after is not None:
-            sign     = "+" if m.eval_after >= 0 else ""
-            eval_str = f"({sign}{m.eval_after/100:.2f})"
+        # Show win probability after the move
+        wp_str = ""
+        if m.wp_after is not None:
+            wp_str = f"{m.wp_after*100:.0f}%"
 
-        same_as_best = "✓" if m.san == m.best_san else " "
         cat_str = _color(
             f"{m.category.symbol:<3} {m.category.label}",
             m.category
@@ -593,7 +635,7 @@ def print_report(report: GameReport) -> None:
 
         print(
             f"  {move_label:>4}  {m.san:<8}  {m.best_san:<8}  "
-            f"{m.cpl:>6.1f}  {cat_str}  {eval_str}"
+            f"{m.wp_loss*100:>7.1f}%  {wp_str:>6}  {cat_str}"
         )
 
     # ── Summary dashboard ────────────────────────────────────────────────
@@ -606,9 +648,9 @@ def print_report(report: GameReport) -> None:
 
     user_moves = [m for m in report.move_analyses if m.is_user_move]
     if user_moves:
-        avg_cpl = sum(m.cpl for m in user_moves) / len(user_moves)
-        print(f"  Moves analyzed:  {len(user_moves)}")
-        print(f"  Avg CPL        :  {avg_cpl:.1f}")
+        avg_wp_loss = sum(m.wp_loss for m in user_moves) / len(user_moves)
+        print(f"  Moves analyzed :  {len(user_moves)}")
+        print(f"  Avg WP Loss    :  {avg_wp_loss*100:.1f}%")
     print()
 
     for cat in _CATEGORY_ORDER:
@@ -640,7 +682,7 @@ def print_report(report: GameReport) -> None:
             )
             note = (
                 f"  Move {m.move_number}{color_prefix}: {m.san:>6}  "
-                f"[{tag}]  CPL={m.cpl:.0f}"
+                f"[{tag}]  WP Loss={m.wp_loss*100:.1f}%"
             )
             if m.san != m.best_san:
                 note += f"  (best: {m.best_san})"
