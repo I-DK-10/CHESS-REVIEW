@@ -1,23 +1,23 @@
-# ♟ Chess Game Review Agent
+# Chess Game Review Agent
 
 A Chess.com-style post-game analysis tool built with Python, powered by Stockfish's UCI engine and WDL (Win/Draw/Loss) evaluation model.
 
 ---
 
-## ✨ Features
+## Features
 
-- 📥 **Flexible PGN Ingestion** — Analyze games by passing a `.pgn` file path or pasting multi-line PGN notation straight into the terminal.
-- 🎯 **WDL Win-Probability Evaluation** — Moves are evaluated based on **Win Probability (WP) Loss**, accounting for positional context and game phase rather than raw centipawn loss.
-- 🏷️ **Chess.com Move Classifications** — Automatically labels every move as **Brilliant (`!!`)**, **Great (`!`)**, **Best (`★`)**, **Excellent (`✓`)**, **Good (`+`)**, **Inaccuracy (`?!`)**, **Mistake (`?`)**, or **Blunder (`??`)**.
-- 💡 **Sacrifice & Only-Move Detection** — Multi-PV analysis identifies true sacrifices and only-good-moves to reward Brilliant and Great moves.
-- 📊 **CAPS2-Style Accuracy Scoring** — Computes a per-move accuracy percentage (0–100%) reflecting how closely your play preserved winning chances.
-- 🎖️ **Elo Estimation** — Predicts performance rating via calibrated interpolation benchmarks against real player games.
-- 🌈 **Terminal Dashboard** — Color-coded per-move breakdown table, visual category distribution bar charts, and a key-moments highlight reel.
-- ⚡ **Optimized Analysis** — Caches board evaluations between plies, cutting required engine operations in half.
+- **Flexible PGN Ingestion** — Analyze games by passing a `.pgn` file path or pasting multi-line PGN notation straight into the terminal.
+- **WDL Win-Probability Evaluation** — Moves are evaluated based on **Win Probability (WP) Loss**, accounting for positional context and game phase rather than raw centipawn loss.
+- **Chess.com Move Classifications** — Automatically labels every move as **Brilliant (`!!`)**, **Great (`!`)**, **Best (`★`)**, **Excellent (`✓`)**, **Good (`+`)**, **Inaccuracy (`?!`)**, **Mistake (`?`)**, or **Blunder (`??`)**.
+- **Sacrifice & Only-Move Detection** — Multi-PV analysis identifies true sacrifices and only-good-moves to reward Brilliant and Great moves.
+- **CAPS2-Style Accuracy Scoring** — Computes a per-move accuracy percentage (0–100%) reflecting how closely your play preserved winning chances.
+- **Elo Estimation** — Predicts performance rating via calibrated interpolation benchmarks against real player games.
+- **Terminal Dashboard** — Color-coded per-move breakdown table, visual category distribution bar charts, and a key-moments highlight reel.
+- **Optimized Analysis** — Caches board evaluations between plies, cutting required engine operations in half.
 
 ---
 
-## 📋 Move Classification System
+## Move Classification System
 
 | Category | Symbol | Description | WP Loss Threshold |
 | :--- | :---: | :--- | :---: |
@@ -32,7 +32,7 @@ A Chess.com-style post-game analysis tool built with Python, powered by Stockfis
 
 ---
 
-## ⚙️ Prerequisites & Setup
+## Prerequisites & Setup
 
 ### 1. Requirements
 - **Python 3.10+**
@@ -56,7 +56,7 @@ Adjust analysis settings if needed:
 
 ---
 
-## 🚀 Usage
+## Usage
 
 ### 1. Analyze from a PGN File
 ```bash
@@ -79,11 +79,11 @@ python chess_review_agent.py
 
 ---
 
-## 🖥️ Sample Report Output
+## Sample Report Output
 
 ```text
 ══════════════════════════════════════════════════════════════════
-  ♟  CHESS GAME REVIEW AGENT
+  CHESS GAME REVIEW AGENT
 ══════════════════════════════════════════════════════════════════
   Event  : Live Chess - chess.com
   Date   : 2026.09.04
@@ -130,7 +130,7 @@ python chess_review_agent.py
 
 ---
 
-## 🧠 How It Works
+## How It Works
 
 1. **Move-by-Move Evaluation**: Replays game positions using `python-chess` and sends UCI analysis requests to Stockfish with `UCI_ShowWDL = True`.
 2. **Win Expectation**: Converts engine evaluations to winning probability using:
