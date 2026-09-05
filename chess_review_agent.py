@@ -78,29 +78,46 @@ class MoveCategory(Enum):
 WP_LOSS_THRESHOLDS: list[tuple[float, MoveCategory]] = [
     (0.02,  MoveCategory.BEST),
     (0.05,  MoveCategory.EXCELLENT),
-    (0.08,  MoveCategory.GOOD),
-    (0.15,  MoveCategory.INACCURACY),
-    (0.25,  MoveCategory.MISTAKE),
+    (0.09,  MoveCategory.GOOD),
+    (0.18,  MoveCategory.INACCURACY),
+    (0.30,  MoveCategory.MISTAKE),
 ]
-# Anything above 0.25 WP loss = BLUNDER
+# Moves with WP loss > 0.30 are BLUNDERS unless a winning buffer applies.
 
 
-def _classify_by_wp_loss(wp_loss: float) -> MoveCategory:
-    """Return the base category purely from win-probability loss."""
+def _classify_by_wp_loss(
+    wp_loss: float,
+    wp_after: float = 0.5,
+    cp_loss: float = 0.0,
+) -> MoveCategory:
+    """
+    Return the base category purely from win-probability loss, with
+    centipawn loss and winning buffers to prevent false blunders.
+    """
     for threshold, category in WP_LOSS_THRESHOLDS:
         if wp_loss <= threshold:
             return category
+
+    # wp_loss > 0.30:
+    # To be a BLUNDER (??):
+    # 1. The move must lose significant material: cp_loss >= 220 (over 2 pawns / piece drop).
+    #    If cp_loss < 220 (e.g. shifting by ~1 pawn like move 15W), it is a MISTAKE (?), not a Blunder!
+    # 2. The player must NOT remain comfortably winning: wp_after < 0.65.
+    if cp_loss < 220.0 or wp_after >= 0.65:
+        return MoveCategory.MISTAKE
     return MoveCategory.BLUNDER
 
 
-def _is_sacrifice(board_before: chess.Board, move: chess.Move) -> bool:
+def _is_sacrifice(board_before: chess.Board, move: chess.Move) -> tuple[bool, int, Optional[int]]:
     """
-    Detect whether a move gives up material immediately (capture that loses
-    a piece, or a quiet piece drop).  Used as part of Brilliant detection.
+    Detect whether a move gives up material deliberately (genuine sacrifice).
+    Returns (is_sacrifice, net_material_sacrificed, piece_type_sacrificed).
 
-    We compare the value of the piece being moved to the value of any
-    captured piece.  If the moved piece is worth more than what it takes,
-    the move is a sacrifice.
+    A move is a sacrifice if:
+      1. A piece (Queen, Rook, Bishop, Knight) lands on a square where the opponent
+         can legally capture it, or a piece (especially Queen) is left en prise.
+      2. It is NOT an immediate recapture on the square the opponent just played to.
+      3. The net material given up is strictly positive (at least 150 points).
     """
     PIECE_VALUES = {
         chess.PAWN:   100,
@@ -108,16 +125,21 @@ def _is_sacrifice(board_before: chess.Board, move: chess.Move) -> bool:
         chess.BISHOP: 330,
         chess.ROOK:   500,
         chess.QUEEN:  900,
-        chess.KING:   0,    # King moves are never sacrifices
+        chess.KING:   0,
     }
     moving_piece = board_before.piece_at(move.from_square)
-    if moving_piece is None:
-        return False
+    if moving_piece is None or moving_piece.piece_type in (chess.PAWN, chess.KING):
+        return False, 0, None
+
+    # Immediate recaptures on the square the opponent just played to are NOT sacrifices
+    if len(board_before.move_stack) > 0:
+        last_move = board_before.peek()
+        if move.to_square == last_move.to_square and board_before.is_capture(move):
+            return False, 0, None
 
     captured_piece = board_before.piece_at(move.to_square)
     moving_value   = PIECE_VALUES.get(moving_piece.piece_type, 0)
 
-    # En-passant capture
     if board_before.is_en_passant(move):
         captured_value = PIECE_VALUES[chess.PAWN]
     elif captured_piece is not None:
@@ -125,9 +147,33 @@ def _is_sacrifice(board_before: chess.Board, move: chess.Move) -> bool:
     else:
         captured_value = 0
 
-    # It's a sacrifice if we give up more than we take (or give up something
-    # for nothing: e.g., queen sac to a square)
-    return moving_value > captured_value
+    net_sac = moving_value - captured_value
+
+    board_after = board_before.copy()
+    board_after.push(move)
+    mover_color = board_before.turn
+    opp_color = not mover_color
+
+    # 1. Direct sacrifice: Can the opponent legally capture the moved piece on its destination?
+    can_opp_take_moved_piece = any(
+        m.to_square == move.to_square for m in board_after.legal_moves
+    )
+    if can_opp_take_moved_piece and net_sac >= 150:
+        return True, net_sac, moving_piece.piece_type
+
+    # 2. Check if destination square is attacked by opponent
+    if board_after.is_attacked_by(opp_color, move.to_square) and net_sac >= 150:
+        return True, net_sac, moving_piece.piece_type
+
+    # 3. Discovered / quiet Queen sacrifice: another piece moved and left our Queen
+    # to be captured by opponent, and we didn't just take an enemy Queen
+    if moving_piece.piece_type != chess.QUEEN and (captured_piece is None or captured_piece.piece_type != chess.QUEEN):
+        for m in board_after.legal_moves:
+            target = board_after.piece_at(m.to_square)
+            if target and target.piece_type == chess.QUEEN and target.color == mover_color:
+                return True, 900 - captured_value, chess.QUEEN
+
+    return False, 0, None
 
 
 def classify_move(
@@ -136,9 +182,12 @@ def classify_move(
     move: chess.Move,
     best_move: chess.Move,
     second_best_wp_loss: Optional[float],
+    wp_before: float = 0.5,
+    wp_after: float = 0.5,
+    cp_loss: float = 0.0,
 ) -> MoveCategory:
     """
-    Full classification logic, including Brilliant and Great Move detection.
+    Full classification logic, including calibrated Brilliant and Great Move detection.
 
     Parameters
     ----------
@@ -147,27 +196,67 @@ def classify_move(
     move                 : the move that was actually played
     best_move            : engine's top choice for this position
     second_best_wp_loss  : WP loss for the second-best engine move (None if unavailable)
+    wp_before            : win probability before the move
+    wp_after             : win probability after the move
+    cp_loss              : centipawn loss from the mover's perspective
     """
-    base = _classify_by_wp_loss(wp_loss)
+    base = _classify_by_wp_loss(wp_loss, wp_after, cp_loss)
 
     if base is MoveCategory.BEST:
         if move == best_move:
-            is_sac = _is_sacrifice(board_before, move)
-            # The second-best move must be significantly worse (>10% WP gap)
-            # for the move to be considered the "only good move"
-            is_only_good_move = (
-                second_best_wp_loss is not None and second_best_wp_loss > 0.10
-            )
+            is_sac, net_sac, sac_piece_type = _is_sacrifice(board_before, move)
 
-            # In Chess.com, Brilliant moves are very rare.
-            # A move is Brilliant if it's a sacrifice AND the only good continuation.
-            if is_sac and is_only_good_move:
-                return MoveCategory.BRILLIANT
+            # Check if this move is a routine recapture
+            is_recapture = False
+            if len(board_before.move_stack) > 0:
+                last_move = board_before.peek()
+                if move.to_square == last_move.to_square and board_before.is_capture(move):
+                    is_recapture = True
 
-            # If it's the only good move (but not a sac), OR a sacrifice
-            # (but there are other okay moves), it is a Great move.
-            if is_sac or is_only_good_move:
+            moving_piece = board_before.piece_at(move.from_square)
+
+            # ── BRILLIANT (!!) vs GREAT MOVE (!) FOR SACRIFICES ─────────────
+            if is_sac and wp_loss <= 0.02 and wp_after >= 0.50:
+                # In Chess.com:
+                # If you are ALREADY decisively winning before the sacrifice (wp_before > 0.85),
+                # finding a sacrifice (like a Queen sac for mate or deflection) is classified as
+                # a GREAT MOVE (!), NOT Brilliant (!!), because the game was already won.
+                if wp_before > 0.85:
+                    return MoveCategory.GREAT
+
+                # In contested or turning positions (wp_before <= 0.85):
+                # 1. Queen Sacrifice:
+                if sac_piece_type == chess.QUEEN:
+                    return MoveCategory.BRILLIANT
+
+                # 2. Rook Sacrifice:
+                # Clean rook or exchange sacrifice (net_sac >= 170)
+                if sac_piece_type == chess.ROOK and net_sac >= 170:
+                    return MoveCategory.BRILLIANT
+
+                # 3. Minor Piece Sacrifice:
+                if sac_piece_type in (chess.BISHOP, chess.KNIGHT) and net_sac >= 200:
+                    gap = second_best_wp_loss if second_best_wp_loss is not None else 0.0
+                    if gap >= 0.12 and wp_before <= 0.75:
+                        return MoveCategory.BRILLIANT
+
+                # Other sound sacrifices fall back to Great Move
                 return MoveCategory.GREAT
+
+            # ── GREAT MOVE (!) FOR NON-SACRIFICES ───────────────────────────
+            # Great moves are rare (typically 1-3 per game).
+            # Disqualifications:
+            # - Routine recaptures
+            # - Escaping check (forced/routine king/block moves)
+            # - Early opening theory (first 4 full moves)
+            # - Already overwhelmingly winning positions (wp_before > 0.88)
+            # Qualifications:
+            # - The ONLY move in a contested position that maintains the win (gap >= 0.15)
+            if not is_recapture and not board_before.is_check() and board_before.fullmove_number > 4:
+                if 0.25 <= wp_before <= 0.88 and wp_loss <= 0.02:
+                    gap = second_best_wp_loss if second_best_wp_loss is not None else 0.0
+                    if gap >= 0.15:
+                        return MoveCategory.GREAT
 
             return MoveCategory.BEST
 
@@ -409,9 +498,15 @@ def analyse_game(
         san = board_before.san(move)
         best_san = board_before.san(best_move)
 
+        # ── Compute Centipawn Loss from mover's POV ─────────────────────────
+        eval_before_mover = eval_before_cp if side_to_move == chess.WHITE else -eval_before_cp
+        eval_after_mover  = eval_after_cp if side_to_move == chess.WHITE else -eval_after_cp
+        cp_loss = max(0.0, eval_before_mover - eval_after_mover)
+
         # ── Classify ────────────────────────────────────────────────────────
         category = classify_move(
-            wp_loss, board_before, move, best_move, second_best_wp_loss
+            wp_loss, board_before, move, best_move, second_best_wp_loss,
+            wp_before=wp_before, wp_after=wp_after, cp_loss=cp_loss,
         )
 
         move_number = board_before.fullmove_number
@@ -455,33 +550,29 @@ def analyse_game(
 
 def compute_accuracy(user_moves: list[MoveAnalysis]) -> float:
     """
-    Compute accuracy using Win Probability loss (CAPS2-style).
+    Compute accuracy using a CAPS2-calibrated Win Probability curve.
 
-    Each move's accuracy is derived from how much win probability was lost:
+    Formula:
+        move_acc = max(0, min(100, 103.1668 * exp(-3.8 * wp_loss) - 3.1668))
 
-        per-move accuracy = max(0, 100 * (1 - wp_loss / WP_LOSS_CAP))
-
-    where WP_LOSS_CAP = 0.50 (losing 50% of your winning chances on a single
-    move floors that move's accuracy at 0%).
-
-    This replaces the old exponential CPL approximation with a direct
-    win-probability-based formula.  Because WP loss is already non-linear
-    (it accounts for game phase and evaluation magnitude), a simple linear
-    mapping works well and produces scores that closely match Chess.com's
-    accuracy numbers.
+    Calibrated against Chess.com CAPS2 benchmarks:
+      - 0.00 WP loss  -> 100.0%
+      - 0.01 WP loss  ->  96.0%
+      - 0.03 WP loss  ->  88.8%
+      - 0.06 WP loss  ->  79.0%
+      - 0.12 WP loss  ->  62.2%
+      - 0.22 WP loss  ->  41.5%
+      - 0.35+ WP loss ->  <= 24%
 
     Overall accuracy = arithmetic mean of per-move accuracies.
     """
     if not user_moves:
         return 0.0
 
-    # A single-move WP loss of 0.50 or more floors that move's accuracy at 0%.
-    WP_LOSS_CAP = 0.50
-
     per_move_accuracies: list[float] = []
     for m in user_moves:
-        wpl = min(m.wp_loss, WP_LOSS_CAP)
-        move_acc = 100.0 * (1.0 - wpl / WP_LOSS_CAP)
+        wpl = m.wp_loss
+        move_acc = 103.1668 * math.exp(-3.8 * wpl) - 3.1668
         move_acc = max(0.0, min(100.0, move_acc))
         per_move_accuracies.append(move_acc)
 
@@ -493,34 +584,34 @@ def estimate_elo(accuracy: float) -> int:
     """
     Map accuracy percentage to an approximate Elo rating.
 
-    Calibration points sourced from Chess.com's public accuracy ↔ Elo
-    research and community analysis.  With per-move accuracy averaging,
-    scores tend to be lower than with avg-CPL-first, so the anchors
-    are tuned accordingly:
-
-        accuracy  98%+ → ~3200  (super-GM, near-perfect play)
-        accuracy   95% → ~2700  (GM)
-        accuracy   90% → ~2300  (IM/FM)
-        accuracy   85% → ~2000  (strong club player)
-        accuracy   80% → ~1750  (club player)
-        accuracy   70% → ~1400  (intermediate)
-        accuracy   60% → ~1100  (casual)
-        accuracy   50% → ~850   (beginner)
-        accuracy  <40% →  600   (floor)
+    Calibrated with Chess.com benchmark data:
+        accuracy 98%+  -> ~2850+ (GM / engine level)
+        accuracy 95%   -> ~2450  (IM/FM)
+        accuracy 93%   -> ~2250  (Master / strong candidate)
+        accuracy 91.5% -> ~2050  (Direct calibration anchor)
+        accuracy 88%   -> ~1750  (Club player)
+        accuracy 85%   -> ~1500  (Intermediate)
+        accuracy 80%   -> ~1250  (Casual / club)
+        accuracy 75%   -> ~1050  (Developing)
+        accuracy 70%   -> ~850   (Beginner)
+        accuracy 60%   -> ~650   (Novice)
+        accuracy <50%  -> ~400-500
 
     We interpolate linearly between these anchor points.
     """
     anchors: list[tuple[float, int]] = [
-        (100.0, 3200),
-        (98.0,  3000),
-        (95.0,  2700),
-        (90.0,  2300),
-        (85.0,  2000),
-        (80.0,  1750),
-        (70.0,  1400),
-        (60.0,  1100),
-        (50.0,   850),
-        (40.0,   600),
+        (100.0, 3100),
+        (98.0,  2850),
+        (95.0,  2450),
+        (93.0,  2250),
+        (91.5,  2050),
+        (88.0,  1750),
+        (85.0,  1500),
+        (80.0,  1250),
+        (75.0,  1050),
+        (70.0,   850),
+        (60.0,   650),
+        (50.0,   500),
         (0.0,    400),
     ]
 

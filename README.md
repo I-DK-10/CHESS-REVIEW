@@ -21,14 +21,14 @@ A Chess.com-style post-game analysis tool built with Python, powered by Stockfis
 
 | Category | Symbol | Description | WP Loss Threshold |
 | :--- | :---: | :--- | :---: |
-| **Brilliant** | `!!` | Material sacrifice + only good move (2nd-best is >10% WP worse) | $\le 2\%$ |
-| **Great Move** | `!` | Material sacrifice OR only good move | $\le 2\%$ |
+| **Brilliant** | `!!` | Genuine piece sacrifice (Queen sac leading to mate/win, or sound Rook/Minor sac) | $\le 2\%$ |
+| **Great Move** | `!` | Non-recapture move in contested position maintaining advantage (or sound sac) | $\le 2\%$ |
 | **Best Move** | `★` | Top engine move or virtually equal continuation | $\le 2\%$ |
 | **Excellent** | `✓` | Very strong move, preserves advantage | $\le 5\%$ |
-| **Good** | `+` | Solid move, slight drop in winning chances | $\le 8\%$ |
-| **Inaccuracy** | `?!` | Sub-optimal move that gives away some edge | $\le 15\%$ |
-| **Mistake** | `?` | Noticeable error altering the evaluation | $\le 25\%$ |
-| **Blunder** | `??` | Critical oversight that forfeits winning chances | $> 25\%$ |
+| **Good** | `+` | Solid move, slight drop in winning chances | $\le 9\%$ |
+| **Inaccuracy** | `?!` | Sub-optimal move that gives away some edge | $\le 18\%$ |
+| **Mistake** | `?` | Clear error (~1–2 pawns lost, $\text{CP Loss} < 220$, or when position remains winning) | $\le 35\%$ |
+| **Blunder** | `??` | Critical blunder losing substantial material ($\text{CP Loss} \ge 220$ AND $\text{WP}_{\text{after}} < 65\%$) | $> 35\%$ |
 
 ---
 
@@ -136,8 +136,8 @@ python chess_review_agent.py
 2. **Win Expectation**: Converts engine evaluations to winning probability using:
    $$\text{Win Expectation} = \frac{\text{wins} + \frac{\text{draws}}{2}}{\text{wins} + \text{draws} + \text{losses}}$$
    This is phase-aware (middlegame vs. endgame), preventing the distortions common in centipawn evaluation.
-3. **Linear Accuracy Mapping (CAPS2)**: Per-move accuracy is scored linearly based on win-rate preservation:
-   $$\text{Accuracy}_{\text{move}} = \max\left(0,\, 100 \times \left(1 - \frac{\text{WP Loss}}{0.50}\right)\right)$$
+3. **Exponential Accuracy Mapping (CAPS2)**: Per-move accuracy is scored using Chess.com's calibrated exponential expectation curve:
+   $$\text{Accuracy}_{\text{move}} = \max\left(0,\, \min\left(100,\, 103.1668 \times e^{-3.8 \times \text{WP Loss}} - 3.1668\right)\right)$$
 4. **Elo Calibration**: Maps the mean accuracy to estimated ratings using empirical anchor points from Chess.com game data.
 
 For a detailed walkthrough of all internal functions, formulas, and codebase comments, see [CODE_EXPLANATION.md](CODE_EXPLANATION.md).

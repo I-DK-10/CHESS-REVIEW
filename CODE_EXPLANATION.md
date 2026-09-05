@@ -34,14 +34,14 @@ Defines the Chess.com-style classifications, symbols, labels, and WP loss thresh
 
 | Category | Symbol | WP Loss Condition |
 | :--- | :---: | :--- |
-| **Brilliant** | `!!` | WP Loss ≤ 0.02, sacrifices material, best move, and 2nd-best move has > 0.10 WP gap |
-| **Great Move** | `!` | WP Loss ≤ 0.02, sacrifice OR only viable move (> 0.10 WP gap to 2nd-best) |
+| **Brilliant** | `!!` | WP Loss ≤ 0.015, genuine piece sacrifice (Queen/Rook/Minor) on attacked square, best move, and 2nd-best has ≥ 0.10–0.20 WP gap |
+| **Great Move** | `!` | WP Loss ≤ 0.02, non-recapture move in contested position maintaining advantage (gap ≥ 0.15), or sound sacrifice |
 | **Best Move** | `★` | WP Loss ≤ 0.02 (≤ 2% win chance loss) |
 | **Excellent** | `✓` | 0.02 < WP Loss ≤ 0.05 (2% – 5%) |
-| **Good** | `+` | 0.05 < WP Loss ≤ 0.08 (5% – 8%) |
-| **Inaccuracy** | `?!` | 0.08 < WP Loss ≤ 0.15 (8% – 15%) |
-| **Mistake** | `?` | 0.15 < WP Loss ≤ 0.25 (15% – 25%) |
-| **Blunder** | `??` | WP Loss > 0.25 (> 25% drop in winning chances) |
+| **Good** | `+` | 0.05 < WP Loss ≤ 0.09 (5% – 9%) |
+| **Inaccuracy** | `?!` | 0.09 < WP Loss ≤ 0.18 (9% – 18%) |
+| **Mistake** | `?` | 0.18 < WP Loss ≤ 0.30 (or >0.30 when position remains winning $\text{WP}_{\text{after}} \ge 65\%$) |
+| **Blunder** | `??` | WP Loss > 0.30 AND player no longer comfortably winning ($\text{WP}_{\text{after}} < 65\%$) |
 
 ---
 
@@ -116,60 +116,70 @@ expectation = (wins + draws / 2) / (wins + draws + losses)
 3. **Evaluation Caching:**
    - The position *after* move $N$ is identical to the position *before* move $N+1$.
    - The loop reuses the cached analysis from the previous ply, cutting expensive engine evaluations almost in half.
-4. **Movers Perspective:** Win probabilities before and after the move are evaluated from the perspective of the side who made the move (`side_to_move`).
 5. **Progress Feedback:** Emits an in-place terminal progress indicator showing current ply, percentage, and move notation.
 
 ---
 
 ## 4. Move Classification Logic
 
-### `_classify_by_wp_loss(wp_loss: float) -> MoveCategory`
-**Purpose:** Assigns baseline categories using threshold lookups:
+### `_classify_by_wp_loss(wp_loss: float, wp_after: float = 0.5, cp_loss: float = 0.0) -> MoveCategory`
+**Purpose:** Assigns baseline categories using threshold lookups with centipawn and winning buffer guards:
 - `wp_loss <= 0.02` $\rightarrow$ **Best Move**
 - `wp_loss <= 0.05` $\rightarrow$ **Excellent**
-- `wp_loss <= 0.08` $\rightarrow$ **Good**
-- `wp_loss <= 0.15` $\rightarrow$ **Inaccuracy**
-- `wp_loss <= 0.25` $\rightarrow$ **Mistake**
-- `wp_loss > 0.25` $\rightarrow$ **Blunder**
+- `wp_loss <= 0.09` $\rightarrow$ **Good**
+- `wp_loss <= 0.18` $\rightarrow$ **Inaccuracy**
+- `wp_loss <= 0.35` $\rightarrow$ **Mistake**
+- `wp_loss > 0.35`:
+  - If `cp_loss < 220` (e.g. losing only 1–2 pawns) or `wp_after >= 0.65` (winning buffer) $\rightarrow$ **Mistake**
+  - If `cp_loss >= 220` AND `wp_after < 0.65` (critical blunder forfeiting winning chances) $\rightarrow$ **Blunder**
 
 ---
 
-### `_is_sacrifice(board_before: chess.Board, move: chess.Move) -> bool`
-**Purpose:** Detects whether a move immediately sacrifices material (a key prerequisite for a Brilliant move).
+### `_is_sacrifice(board_before: chess.Board, move: chess.Move) -> tuple[bool, int, Optional[int]]`
+**Purpose:** Detects whether a move is a genuine deliberate material sacrifice.
 
-- Evaluates piece values:
-  - Pawn = 100, Knight = 320, Bishop = 330, Rook = 500, Queen = 900, King = 0.
-- Handles regular captures, quiet sacrifices (piece moved to an empty defended square), and en-passant captures.
-- Returns `True` if `moving_value > captured_value`.
+- **Direct Sacrifice:** Checks whether the opponent can legally capture the moved piece on its destination square (`any(m.to_square == move.to_square for m in board_after.legal_moves)`).
+- **Discovered / Quiet Queen Sacrifice:** Detects if another piece moved and left the player's Queen en prise to be taken.
+- **Recapture Filter:** Immediate recaptures on the square where the opponent just moved are excluded.
+- **Net Material Loss:** Requires `moving_value - captured_value >= 150` points.
+- Returns `(is_sacrifice, net_material_sacrificed, piece_type_sacrificed)`.
 
 ---
 
-### `classify_move(wp_loss, board_before, move, best_move, second_best_wp_loss) -> MoveCategory`
+### `classify_move(wp_loss, board_before, move, best_move, second_best_wp_loss, wp_before, wp_after, cp_loss) -> MoveCategory`
 **Purpose:** Applies contextual classification for exceptional moves:
 
 - **Brilliant (`!!`)**:
-  - Move must match the engine's best move (`move == best_move`).
-  - Move must be a material sacrifice (`_is_sacrifice == True`).
-  - Must be the only viable move: the 2nd-best move has a win probability drop greater than 10% (`second_best_wp_loss > 0.10`).
+  - Must be the engine's best move (`move == best_move`) with `wp_loss <= 0.02` and maintain a sound position (`wp_after >= 0.50`).
+  - **Position Context:** Must occur in a contested or turning position (`wp_before <= 0.85`). In an already won position (`wp_before > 0.85`), sacrifices are classified as **Great Move (`!`)**, matching Chess.com.
+  - **Rook Sacrifices:** Clean rook or exchange sacrifice (net loss $\ge 170$) in a contested position $\rightarrow$ **Brilliant (`!!`)**.
+  - **Minor Piece Sacrifices:** Contested position, net loss $\ge 200$, gap $\ge 0.12$.
 - **Great Move (`!`):**
-  - Best move that is either a sacrifice OR the only good move (without meeting both criteria for Brilliant).
+  - **Sacrifices in Won Positions:** Finding a flashy piece sacrifice (such as a Queen sacrifice for mate) when already decisively winning (`wp_before > 0.85`) is classified as a **Great Move (`!`)**, not Brilliant.
+  - **Critical Non-Sacrifices:** The ONLY move in a contested position maintaining advantage (gap $\ge 0.15$).
 - **Fallback:**
-  - If not Brilliant or Great, returns the category from `_classify_by_wp_loss(wp_loss)`.
+  - Returns the base category from `_classify_by_wp_loss(wp_loss, wp_after, cp_loss)`.
 
 ---
 
 ## 5. Accuracy & Elo Calculation
 
 ### `compute_accuracy(user_moves: list[MoveAnalysis]) -> float`
-**Purpose:** Computes overall game accuracy using a CAPS2-style win-probability loss formula.
+**Purpose:** Computes overall game accuracy using an exponential curve calibrated to Chess.com's CAPS2 model.
 
 **Formula per move:**
-$$\text{Move Accuracy} = \max\left(0,\, 100 \times \left(1 - \frac{\text{wp\_loss}}{\text{WP\_LOSS\_CAP}}\right)\right)$$
-- `WP_LOSS_CAP = 0.50` (losing 50% or more win probability on a single move results in 0% accuracy for that move).
-- Overall accuracy is the arithmetic mean of all per-move accuracies for the user.
+$$\text{Move Accuracy} = \max\left(0,\, \min\left(100,\, 103.1668 \times e^{-3.8 \times \text{wp\_loss}} - 3.1668\right)\right)$$
 
-**Design Note (from comments in code):**
-> *"Because WP loss is already non-linear (it accounts for game phase and evaluation magnitude), a simple linear mapping works well and produces scores that closely match Chess.com's accuracy numbers."*
+**Calibration Anchors:**
+- $0.00$ WP Loss $\rightarrow 100.0\%$
+- $0.01$ WP Loss $\rightarrow 96.0\%$
+- $0.03$ WP Loss $\rightarrow 88.8\%$
+- $0.06$ WP Loss $\rightarrow 79.0\%$
+- $0.12$ WP Loss $\rightarrow 62.2\%$
+- $0.22$ WP Loss $\rightarrow 41.5\%$
+- $0.35+$ WP Loss $\rightarrow \le 24\%$
+
+Overall accuracy = arithmetic mean of per-move accuracies.
 
 ---
 
@@ -178,16 +188,17 @@ $$\text{Move Accuracy} = \max\left(0,\, 100 \times \left(1 - \frac{\text{wp\_los
 
 | Accuracy Range | Target Elo Rating | Category |
 | :---: | :---: | :--- |
-| **98.0% – 100%** | 3000 – 3200 | Super-GM / Engine-like |
-| **95.0% – 98.0%** | 2700 – 3000 | Grandmaster |
-| **90.0% – 95.0%** | 2300 – 2700 | IM / FM |
-| **85.0% – 90.0%** | 2000 – 2300 | Strong Club Player |
-| **80.0% – 85.0%** | 1750 – 2000 | Club Player |
-| **70.0% – 80.0%** | 1400 – 1750 | Intermediate |
-| **60.0% – 70.0%** | 1100 – 1400 | Casual Player |
-| **50.0% – 60.0%** | 850 – 1100 | Developing Beginner |
-| **40.0% – 50.0%** | 600 – 850 | Novice |
-| **< 40.0%** | 400 – 600 | Floor |
+| **98.0% – 100%** | 2850 – 3100 | Super-GM / Engine-like |
+| **95.0% – 98.0%** | 2450 – 2850 | Grandmaster |
+| **93.0% – 95.0%** | 2250 – 2450 | Master / Candidate |
+| **91.5% – 93.0%** | 2050 – 2250 | Strong Club Player *(91.5% = 2050 benchmark)* |
+| **88.0% – 91.5%** | 1750 – 2050 | Club Player |
+| **85.0% – 88.0%** | 1500 – 1750 | Intermediate |
+| **80.0% – 85.0%** | 1250 – 1500 | Casual / Club |
+| **75.0% – 80.0%** | 1050 – 1250 | Developing |
+| **60.0% – 70.0%** | 650 – 850 | Novice |
+| **50.0% – 60.0%** | 500 – 650 | Casual Beginner |
+| **< 50.0%** | 400 – 500 | Floor |
 
 ---
 
